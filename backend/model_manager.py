@@ -264,8 +264,9 @@ class ModelManager:
                             "message": f"Step {state.global_step}/{self_cb.total_steps} — loss: {loss}"
                         }
 
-            # formatting_func MUST return a list (Unsloth batched requirement)
-            def formatting_func(examples):
+            # Pre-apply chat template to entire dataset before training
+            # This avoids all batching/indexing issues with formatting_func
+            def apply_template(examples):
                 texts = []
                 for msgs in examples["messages"]:
                     text = tokenizer.apply_chat_template(
@@ -274,7 +275,14 @@ class ModelManager:
                         add_generation_prompt=False,
                     )
                     texts.append(text)
-                return texts
+                return {"text": texts}
+
+            dataset = dataset.map(
+                apply_template,
+                batched=True,
+                num_proc=2,
+                desc="Applying chat template",
+            )
 
             sft_config = SFTConfig(
                 per_device_train_batch_size=BATCH_SIZE,
@@ -293,6 +301,7 @@ class ModelManager:
                 save_strategy="no",
                 max_seq_length=MAX_SEQ_LENGTH,
                 dataset_num_proc=2,
+                dataset_text_field="text",
                 packing=True,
             )
 
@@ -300,7 +309,6 @@ class ModelManager:
                 model=model,
                 tokenizer=tokenizer,
                 train_dataset=dataset,
-                formatting_func=formatting_func,
                 args=sft_config,
                 callbacks=[ProgressCallback(MAX_STEPS)],
             )
