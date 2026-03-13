@@ -179,10 +179,10 @@ class ModelManager:
             os.makedirs(output_dir, exist_ok=True)
 
             # ── Tune these for your GPU ──────────────────────────────────────
-            MAX_SEQ_LENGTH = 4096   # 4096 ctx fills ~14 GB on 4-bit Qwen3-4B
-            LORA_RANK      = 32     # 32 = better quality vs 16, ~2 GB more VRAM
-            BATCH_SIZE     = 4      # per-device batch
-            GRAD_ACCUM     = 4      # effective batch = 16
+            MAX_SEQ_LENGTH = 2048   # keep low given 7.7 GB system RAM
+            LORA_RANK      = 16     # keep low to reduce gradient offload size
+            BATCH_SIZE     = 1      # minimal batch to save system RAM
+            GRAD_ACCUM     = 16     # effective batch = 16
             MAX_STEPS      = 100
             # ────────────────────────────────────────────────────────────────
 
@@ -231,7 +231,7 @@ class ModelManager:
                 lora_alpha=LORA_RANK,   # alpha = rank is standard
                 lora_dropout=0,
                 bias="none",
-                use_gradient_checkpointing="unsloth",
+                use_gradient_checkpointing=True,  # "unsloth" offloads to RAM; True keeps on GPU
                 random_state=3407,
                 use_rslora=False,
                 loftq_config=None,
