@@ -5,11 +5,12 @@ import time
 from typing import Optional, List, Dict
 from datetime import datetime
 import logging
+
 logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.ERROR)
 
 MODELS_DIR = "models"
 REGISTRY_FILE = os.path.join(MODELS_DIR, "registry.json")
-BASE_MODEL_NAME = "Qwen/Qwen3-4B"   # HuggingFace id
+BASE_MODEL_NAME = "Qwen/Qwen3-4B"
 BASE_MODEL_DIR = os.path.join(MODELS_DIR, "qwen3-4b-base")
 
 
@@ -38,18 +39,28 @@ class ModelManager:
             json.dump(data, f, indent=2)
 
     def _register_model(self, model_id: str, path: str, model_type: str,
-                         parent_id: Optional[str] = None, pdfs: List[str] = None):
+                        parent_id: Optional[str] = None, pdfs: List[str] = None):
         registry = self._load_registry()
         registry["models"][model_id] = {
             "id": model_id,
             "path": path,
-            "type": model_type,          # "base" | "trained"
+            "type": model_type,       # "base" | "trained"
             "parent_id": parent_id,
             "pdfs_trained_on": pdfs or [],
             "created_at": datetime.now().isoformat(),
             "deletable": model_type != "base"
         }
         self._save_registry(registry)
+
+    def _resolve_base_path(self, model_id: str, registry: dict) -> str:
+        """Walk the parent chain until we find the base model path."""
+        meta = registry["models"][model_id]
+        if meta["type"] == "base":
+            return meta["path"]
+        parent_id = meta.get("parent_id")
+        if not parent_id or parent_id not in registry["models"]:
+            raise ValueError(f"Cannot resolve base model for '{model_id}' — parent '{parent_id}' missing from registry")
+        return self._resolve_base_path(parent_id, registry)
 
     # ─── Model listing ─────────────────────────────────────────────────────────
 
@@ -74,12 +85,14 @@ class ModelManager:
                     pass
         return round(total / 1024 / 1024, 1)
 
-    # ─── Base model ────────────────────────────────────────────────────────────
+    # ─── Base model download ───────────────────────────────────────────────────
 
     def base_model_exists(self) -> bool:
-        return (os.path.exists(BASE_MODEL_DIR) and
-                any(f.endswith(".safetensors") or f.endswith(".bin")
-                    for f in os.listdir(BASE_MODEL_DIR)))
+        return (
+            os.path.exists(BASE_MODEL_DIR) and
+            any(f.endswith(".safetensors") or f.endswith(".bin")
+                for f in os.listdir(BASE_MODEL_DIR))
+        )
 
     def get_download_status(self) -> dict:
         return self.download_status
@@ -88,14 +101,13 @@ class ModelManager:
         """Download Qwen3-4B from HuggingFace using snapshot_download."""
         try:
             from huggingface_hub import snapshot_download
+            import threading
+
             self.download_status = {
                 "status": "downloading", "progress": 5,
                 "message": "Starting download of Qwen3-4B (~8 GB)..."
             }
             os.makedirs(BASE_MODEL_DIR, exist_ok=True)
-
-            # snapshot_download streams with progress; we poll for dir size
-            import threading
 
             done = [False]
             error = [None]
@@ -115,7 +127,7 @@ class ModelManager:
             dl_thread = threading.Thread(target=do_download)
             dl_thread.start()
 
-            TARGET_MB = 8_000  # approximate expected size
+            TARGET_MB = 8_000
             while not done[0]:
                 size = self._dir_size_mb(BASE_MODEL_DIR)
                 pct = min(95, int(size / TARGET_MB * 90) + 5)
@@ -129,7 +141,6 @@ class ModelManager:
             if error[0]:
                 raise error[0]
 
-            # Register in registry
             self._register_model("base", BASE_MODEL_DIR, "base")
             self.download_status = {
                 "status": "completed", "progress": 100,
@@ -143,37 +154,62 @@ class ModelManager:
     # ─── Training ──────────────────────────────────────────────────────────────
 
     def train_model(self, dataset_path: str, base_model_id: str, output_name: str):
-        """Fine-tune a model. base_model_id can be 'base' or any trained model id."""
+        """
+        Fine-tune a model.
+        base_model_id can be 'base' or any previously trained model id.
+        For trained models we always load the true base weights first,
+        then apply the LoRA adapter before adding new LoRA layers.
+        """
         import torch
         from unsloth import FastLanguageModel
         from trl import SFTTrainer
-        from transformers import TrainingArguments
+        from transformers import TrainingArguments, TrainerCallback
         from datasets import load_dataset
 
         try:
-            # Resolve source model path
             registry = self._load_registry()
             if base_model_id not in registry["models"]:
                 raise ValueError(f"Model '{base_model_id}' not found in registry")
-            source_path = registry["models"][base_model_id]["path"]
-            if not os.path.exists(source_path):
-                raise FileNotFoundError(f"Source model path does not exist: {source_path}")
 
+            meta = registry["models"][base_model_id]
             output_dir = os.path.join(MODELS_DIR, output_name)
             os.makedirs(output_dir, exist_ok=True)
 
             self.training_status = {
                 "status": "loading", "progress": 20,
-                "message": f"Loading model from {base_model_id}..."
+                "message": f"Loading model from '{base_model_id}'..."
             }
 
+            # Always start from the true base weights
+            if meta["type"] == "trained":
+                true_base_path = self._resolve_base_path(base_model_id, registry)
+                adapter_path   = meta["path"]
+            else:
+                true_base_path = meta["path"]
+                adapter_path   = None
+
+            if not os.path.exists(true_base_path):
+                raise FileNotFoundError(f"Base model path missing: {true_base_path}")
+
             model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=source_path,
+                model_name=true_base_path,
                 max_seq_length=2048,
                 dtype=None,
                 load_in_4bit=True,
             )
 
+            # If we're continuing from a trained adapter, load it first
+            if adapter_path:
+                self.training_status = {
+                    "status": "loading", "progress": 25,
+                    "message": f"Applying adapter from '{base_model_id}'..."
+                }
+                from peft import PeftModel
+                model = PeftModel.from_pretrained(model, adapter_path)
+                # Merge adapter weights into base so we can add fresh LoRA on top
+                model = model.merge_and_unload()
+
+            # Add fresh LoRA adapters for this training run
             model = FastLanguageModel.get_peft_model(
                 model,
                 r=16,
@@ -200,8 +236,7 @@ class ModelManager:
                 "message": f"Training on {len(dataset)} examples..."
             }
 
-            # Callback to update progress
-            from transformers import TrainerCallback
+            MAX_STEPS = 100
 
             class ProgressCallback(TrainerCallback):
                 def __init__(self_cb, total_steps):
@@ -209,15 +244,13 @@ class ModelManager:
 
                 def on_log(self_cb, args, state, control, logs=None, **kwargs):
                     if state.global_step and self_cb.total_steps:
-                        pct = 40 + int(state.global_step / self_cb.total_steps * 50)
+                        pct  = 40 + int(state.global_step / self_cb.total_steps * 50)
                         loss = logs.get("loss", "?") if logs else "?"
                         self.training_status = {
                             "status": "training",
                             "progress": pct,
                             "message": f"Step {state.global_step}/{self_cb.total_steps} — loss: {loss}"
                         }
-
-            MAX_STEPS = 100
 
             training_args = TrainingArguments(
                 per_device_train_batch_size=2,
@@ -258,16 +291,13 @@ class ModelManager:
             model.save_pretrained(output_dir)
             tokenizer.save_pretrained(output_dir)
 
-            # Write metadata
-            meta_path = os.path.join(output_dir, "train_meta.json")
-            with open(meta_path, "w") as f:
+            with open(os.path.join(output_dir, "train_meta.json"), "w") as f:
                 json.dump({
                     "base_model_id": base_model_id,
                     "trained_at": datetime.now().isoformat(),
                     "dataset_path": dataset_path,
                 }, f, indent=2)
 
-            # Register
             self._register_model(output_name, output_dir, "trained",
                                   parent_id=base_model_id)
 
@@ -288,11 +318,12 @@ class ModelManager:
         registry = self._load_registry()
         if model_id not in registry["models"]:
             raise FileNotFoundError(f"Model '{model_id}' not in registry")
+
         meta = registry["models"][model_id]
         if not meta.get("deletable", True):
             raise ValueError("Cannot delete the base model")
 
-        # Unload from memory if loaded
+        # Unload from memory if currently loaded
         if self.loaded_chat_model_id == model_id:
             self._chat_model = None
             self._chat_tokenizer = None
@@ -308,7 +339,11 @@ class ModelManager:
     # ─── Chat ─────────────────────────────────────────────────────────────────
 
     def load_chat_model(self, model_id: str):
-        """Load a model into memory for chatting."""
+        """
+        Load a model into memory for inference.
+        For trained models: load true base weights, then apply the LoRA adapter.
+        For the base model: load directly.
+        """
         if self.loaded_chat_model_id == model_id:
             return  # already loaded
 
@@ -316,21 +351,51 @@ class ModelManager:
 
         registry = self._load_registry()
         if model_id not in registry["models"]:
-            raise FileNotFoundError(f"Model '{model_id}' not found")
-        path = registry["models"][model_id]["path"]
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Model directory missing: {path}")
+            raise FileNotFoundError(f"Model '{model_id}' not found in registry")
 
-        # Unload previous
+        meta = registry["models"][model_id]
+
+        # Free previous model
         self._chat_model = None
         self._chat_tokenizer = None
 
-        self._chat_model, self._chat_tokenizer = FastLanguageModel.from_pretrained(
-            model_name=path,
-            max_seq_length=2048,
-            dtype=None,
-            load_in_4bit=True,
-        )
+        if meta["type"] == "trained":
+            # Resolve the true base and the adapter path
+            true_base_path = self._resolve_base_path(model_id, registry)
+            adapter_path   = meta["path"]
+
+            if not os.path.exists(true_base_path):
+                raise FileNotFoundError(f"Base model path missing: {true_base_path}")
+            if not os.path.exists(adapter_path):
+                raise FileNotFoundError(f"Adapter path missing: {adapter_path}")
+
+            # Load base weights
+            self._chat_model, self._chat_tokenizer = FastLanguageModel.from_pretrained(
+                model_name=true_base_path,
+                max_seq_length=2048,
+                dtype=None,
+                load_in_4bit=True,
+            )
+
+            # Apply LoRA adapter on top
+            from peft import PeftModel
+            self._chat_model = PeftModel.from_pretrained(
+                self._chat_model,
+                adapter_path
+            )
+
+        else:
+            # It's the base model — load directly
+            if not os.path.exists(meta["path"]):
+                raise FileNotFoundError(f"Base model path missing: {meta['path']}")
+
+            self._chat_model, self._chat_tokenizer = FastLanguageModel.from_pretrained(
+                model_name=meta["path"],
+                max_seq_length=2048,
+                dtype=None,
+                load_in_4bit=True,
+            )
+
         FastLanguageModel.for_inference(self._chat_model)
         self.loaded_chat_model_id = model_id
 
@@ -338,9 +403,9 @@ class ModelManager:
         if self._chat_model is None or self.loaded_chat_model_id != model_id:
             self.load_chat_model(model_id)
 
-        # Build conversation with history
+        # Build prompt with last 6 turns of history for context
         conv = ""
-        for turn in history[-6:]:  # last 6 turns
+        for turn in history[-6:]:
             if turn.get("role") == "user":
                 conv += f"### Instruction:\n{turn['content']}\n"
             elif turn.get("role") == "assistant":
