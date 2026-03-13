@@ -255,15 +255,28 @@ class ModelManager:
             class ProgressCallback(TrainerCallback):
                 def __init__(self_cb, total_steps):
                     self_cb.total_steps = total_steps
+                    self_cb.last_loss = "..."
 
-                def on_log(self_cb, args, state, control, logs=None, **kwargs):
-                    if state.global_step and self_cb.total_steps:
-                        pct  = 40 + int(state.global_step / self_cb.total_steps * 50)
-                        loss = logs.get("loss", "?") if logs else "?"
+                def on_step_end(self_cb, args, state, control, **kwargs):
+                    # fires every single step — updates progress even without a loss value
+                    if self_cb.total_steps:
+                        pct = 40 + int(state.global_step / self_cb.total_steps * 50)
                         manager.training_status = {
                             "status": "training",
                             "progress": pct,
-                            "message": f"Step {state.global_step}/{self_cb.total_steps} — loss: {loss}"
+                            "message": f"Step {state.global_step}/{self_cb.total_steps} — loss: {self_cb.last_loss}"
+                        }
+
+                def on_log(self_cb, args, state, control, logs=None, **kwargs):
+                    # fires every logging_steps — captures the actual loss value
+                    if logs:
+                        self_cb.last_loss = round(logs.get("loss", 0), 4)
+                    if self_cb.total_steps:
+                        pct = 40 + int(state.global_step / self_cb.total_steps * 50)
+                        manager.training_status = {
+                            "status": "training",
+                            "progress": pct,
+                            "message": f"Step {state.global_step}/{self_cb.total_steps} — loss: {self_cb.last_loss}"
                         }
 
             # Pre-apply chat template to entire dataset before training
