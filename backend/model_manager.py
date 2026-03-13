@@ -250,6 +250,8 @@ class ModelManager:
                 "message": f"Training on {len(dataset)} examples — ctx {MAX_SEQ_LENGTH}, rank {LORA_RANK}..."
             }
 
+            manager = self  # capture ModelManager reference for use inside callback
+
             class ProgressCallback(TrainerCallback):
                 def __init__(self_cb, total_steps):
                     self_cb.total_steps = total_steps
@@ -258,7 +260,7 @@ class ModelManager:
                     if state.global_step and self_cb.total_steps:
                         pct  = 40 + int(state.global_step / self_cb.total_steps * 50)
                         loss = logs.get("loss", "?") if logs else "?"
-                        self.training_status = {
+                        manager.training_status = {
                             "status": "training",
                             "progress": pct,
                             "message": f"Step {state.global_step}/{self_cb.total_steps} — loss: {loss}"
