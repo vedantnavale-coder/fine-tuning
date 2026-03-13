@@ -270,13 +270,22 @@ class ModelManager:
                 save_strategy="no",
             )
 
+            def formatting_func(example):
+                """Apply Qwen3 chat template to each training example."""
+                return tokenizer.apply_chat_template(
+                    example["messages"],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+
             trainer = SFTTrainer(
                 model=model,
                 tokenizer=tokenizer,
                 train_dataset=dataset,
+                formatting_func=formatting_func,
                 max_seq_length=2048,
                 dataset_num_proc=2,
-                packing=False,          # must be False with messages format
+                packing=False,
                 args=training_args,
                 callbacks=[ProgressCallback(MAX_STEPS)],
             )
