@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NEURAL FORGE — Local AI Training</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+    <div class="scanlines"></div>
+    <div class="noise"></div>
+
+    <header class="header">
+        <div class="header-inner">
+            <div class="logo">
+                <span class="logo-icon">⬡</span>
+                <span class="logo-text">NEURAL<strong>FORGE</strong></span>
+            </div>
+            <nav class="nav-tabs">
+                <button class="nav-tab active" data-tab="setup">SETUP</button>
+                <button class="nav-tab" data-tab="train">TRAIN</button>
+                <button class="nav-tab" data-tab="models">MODELS</button>
+                <button class="nav-tab" data-tab="chat">CHAT</button>
+            </nav>
+            <div class="header-status">
+                <span class="status-dot idle" id="globalStatusDot"></span>
+                <span id="globalStatusText">IDLE</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main">
+
+        <!-- ── SETUP TAB ────────────────────────────────── -->
+        <section class="tab-panel active" id="tab-setup">
+            <div class="two-col">
+
+                <!-- Base model download -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-icon">⬇</span>
+                        <h2>BASE MODEL</h2>
+                    </div>
+                    <div class="card-body">
+                        <div class="model-spec">
+                            <div class="spec-row">
+                                <span class="spec-label">Model</span>
+                                <span class="spec-val">Qwen3-4B</span>
+                            </div>
+                            <div class="spec-row">
+                                <span class="spec-label">Parameters</span>
+                                <span class="spec-val">4.4 Billion</span>
+                            </div>
+                            <div class="spec-row">
+                                <span class="spec-label">Quantization</span>
+                                <span class="spec-val">4-bit NF4</span>
+                            </div>
+                            <div class="spec-row">
+                                <span class="spec-label">Download Size</span>
+                                <span class="spec-val">~8 GB</span>
+                            </div>
+                        </div>
+
+                        <div id="baseModelStatus" class="infobox">Checking local model...</div>
+
+                        <div class="progress-wrap hidden" id="downloadProgressWrap">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="downloadProgress" style="width:0%"></div>
+                            </div>
+                            <span class="progress-label" id="downloadLabel">0%</span>
+                        </div>
+
+                        <button class="btn btn-primary" id="downloadBtn" onclick="downloadBaseModel()" disabled>
+                            CHECK / DOWNLOAD
+                        </button>
+                    </div>
+                </div>
+
+                <!-- PDF upload -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-icon">◈</span>
+                        <h2>UPLOAD DOCUMENTS</h2>
+                    </div>
+                    <div class="card-body">
+                        <div class="drop-zone" id="dropZone">
+                            <div class="drop-icon">⊕</div>
+                            <p>Drop PDF files here</p>
+                            <span>or click to browse</span>
+                            <input type="file" id="fileInput" accept=".pdf" multiple hidden />
+                        </div>
+                        <div class="pdf-list" id="pdfList"></div>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- ── TRAIN TAB ─────────────────────────────────── -->
+        <section class="tab-panel" id="tab-train">
+            <div class="two-col">
+
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-icon">◎</span>
+                        <h2>TRAINING CONFIG</h2>
+                    </div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <label>SOURCE MODEL</label>
+                            <select id="sourceModelSelect" class="select">
+                                <option value="">— loading models —</option>
+                            </select>
+                            <p class="hint">Train on top of base or any previously trained model</p>
+                        </div>
+
+                        <div class="form-group">
+                            <label>OUTPUT MODEL NAME</label>
+                            <input type="text" id="outputModelName" class="input" placeholder="e.g. trained_v2"
+                                value="trained_v1" />
+                        </div>
+
+                        <div class="form-group">
+                            <label>SELECT PDFs TO TRAIN ON</label>
+                            <div class="pdf-check-list" id="trainPdfList">
+                                <span class="muted">No PDFs uploaded yet</span>
+                            </div>
+                        </div>
+
+                        <button class="btn btn-accent" id="trainBtn" onclick="startTraining()">
+                            ▶ START TRAINING
+                        </button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-icon">▣</span>
+                        <h2>TRAINING MONITOR</h2>
+                    </div>
+                    <div class="card-body">
+                        <div class="terminal" id="trainingLog">
+                            <span class="muted">Waiting for training to start...</span>
+                        </div>
+                        <div class="progress-wrap" style="margin-top:16px">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="trainProgress" style="width:0%"></div>
+                            </div>
+                            <span class="progress-label" id="trainProgressLabel">0%</span>
+                        </div>
+                        <div class="status-badge idle" id="trainStatusBadge">IDLE</div>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- ── MODELS TAB ────────────────────────────────── -->
+        <section class="tab-panel" id="tab-models">
+            <div class="card card-full">
+                <div class="card-header">
+                    <span class="card-icon">◆</span>
+                    <h2>MODEL REGISTRY</h2>
+                    <button class="btn btn-sm" onclick="loadModels()">↻ REFRESH</button>
+                </div>
+                <div class="card-body">
+                    <div class="model-grid" id="modelGrid">
+                        <span class="muted">Loading...</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── CHAT TAB ──────────────────────────────────── -->
+        <section class="tab-panel" id="tab-chat">
+            <div class="chat-layout">
+
+                <div class="chat-sidebar">
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-icon">◍</span>
+                            <h2>MODEL</h2>
+                        </div>
+                        <div class="card-body">
+                            <div class="form-group">
+                                <label>SELECT MODEL</label>
+                                <select id="chatModelSelect" class="select">
+                                    <option value="">— no models —</option>
+                                </select>
+                            </div>
+                            <button class="btn btn-primary" id="loadModelBtn" onclick="loadChatModel()">
+                                LOAD INTO MEMORY
+                            </button>
+                            <div class="infobox" id="loadedModelInfo">No model loaded</div>
+
+                            <div class="divider"></div>
+
+                            <div class="form-group">
+                                <label>TEMPERATURE</label>
+                                <input type="range" id="tempSlider" min="0" max="1" step="0.05" value="0.7"
+                                    oninput="document.getElementById('tempVal').textContent=this.value" />
+                                <span id="tempVal" class="mono">0.7</span>
+                            </div>
+
+                            <button class="btn btn-ghost" onclick="clearChat()">⌫ CLEAR CHAT</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="chat-main">
+                    <div class="chat-messages" id="chatMessages">
+                        <div class="chat-welcome">
+                            <div class="welcome-icon">⬡</div>
+                            <p>Load a model and start chatting</p>
+                        </div>
+                    </div>
+                    <div class="chat-input-row">
+                        <textarea id="chatInput" class="chat-textarea"
+                            placeholder="Ask anything about your documents..." rows="3"
+                            onkeydown="handleChatKey(event)"></textarea>
+                        <button class="btn btn-send" id="sendBtn" onclick="sendMessage()">
+                            <span>SEND</span>
+                            <span class="send-arrow">→</span>
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+    </main>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
