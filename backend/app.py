@@ -47,10 +47,6 @@ class DeleteModelRequest(BaseModel):
 
 # ─── Root ───────────────────────────────────────────────────────────────────
 
-@app.get("/")
-async def root():
-    return FileResponse("frontend/index.html")
-
 # ─── PDF endpoints ───────────────────────────────────────────────────────────
 
 @app.post("/api/upload")
@@ -189,7 +185,7 @@ async def get_loaded_model():
     return {"loaded_model": model_manager.loaded_chat_model_id}
 
 # Mount frontend
-app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     import uvicorn
