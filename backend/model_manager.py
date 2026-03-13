@@ -6,7 +6,6 @@ from typing import Optional, List, Dict
 from datetime import datetime
 import logging
 
-logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.ERROR)
 
 MODELS_DIR = "models"
 REGISTRY_FILE = os.path.join(MODELS_DIR, "registry.json")
