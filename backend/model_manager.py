@@ -161,11 +161,13 @@ class ModelManager:
         Fine-tune using Qwen3 chat format.
         For iterative training: loads base weights, merges any existing
         adapter, then adds fresh LoRA layers for this run.
+        Tuned for RTX 5070 Ti / 16 GB VRAM.
         """
         import torch
         from unsloth import FastLanguageModel
-        from trl import SFTTrainer
-        from transformers import TrainingArguments, TrainerCallback
+        from unsloth.chat_templates import get_chat_template
+        from trl import SFTTrainer, SFTConfig
+        from transformers import TrainerCallback
         from datasets import load_dataset
 
         try:
@@ -176,6 +178,14 @@ class ModelManager:
             meta       = registry["models"][base_model_id]
             output_dir = os.path.join(MODELS_DIR, output_name)
             os.makedirs(output_dir, exist_ok=True)
+
+            # ── Tune these for your GPU ──────────────────────────────────────
+            MAX_SEQ_LENGTH = 4096   # 4096 ctx fills ~14 GB on 4-bit Qwen3-4B
+            LORA_RANK      = 32     # 32 = better quality vs 16, ~2 GB more VRAM
+            BATCH_SIZE     = 4      # per-device batch
+            GRAD_ACCUM     = 4      # effective batch = 16
+            MAX_STEPS      = 100
+            # ────────────────────────────────────────────────────────────────
 
             self.training_status = {
                 "status": "loading", "progress": 20,
@@ -195,10 +205,13 @@ class ModelManager:
 
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=true_base_path,
-                max_seq_length=2048,
-                dtype=None,
+                max_seq_length=MAX_SEQ_LENGTH,
+                dtype=None,           # auto: bfloat16 on Ampere+
                 load_in_4bit=True,
             )
+
+            # Apply Qwen3 instruct chat template to tokenizer
+            tokenizer = get_chat_template(tokenizer, chat_template="qwen3-instruct")
 
             # If continuing from a trained model, merge its adapter first
             if adapter_path:
@@ -213,10 +226,10 @@ class ModelManager:
             # Add fresh LoRA adapters for this training run
             model = FastLanguageModel.get_peft_model(
                 model,
-                r=16,
+                r=LORA_RANK,
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                                  "gate_proj", "up_proj", "down_proj"],
-                lora_alpha=16,
+                lora_alpha=LORA_RANK,   # alpha = rank is standard
                 lora_dropout=0,
                 bias="none",
                 use_gradient_checkpointing="unsloth",
@@ -234,10 +247,8 @@ class ModelManager:
 
             self.training_status = {
                 "status": "training", "progress": 40,
-                "message": f"Training on {len(dataset)} examples..."
+                "message": f"Training on {len(dataset)} examples — ctx {MAX_SEQ_LENGTH}, rank {LORA_RANK}..."
             }
-
-            MAX_STEPS = 100
 
             class ProgressCallback(TrainerCallback):
                 def __init__(self_cb, total_steps):
@@ -253,9 +264,21 @@ class ModelManager:
                             "message": f"Step {state.global_step}/{self_cb.total_steps} — loss: {loss}"
                         }
 
-            training_args = TrainingArguments(
-                per_device_train_batch_size=2,
-                gradient_accumulation_steps=8,
+            # formatting_func MUST return a list (Unsloth batched requirement)
+            def formatting_func(examples):
+                texts = []
+                for msgs in examples["messages"]:
+                    text = tokenizer.apply_chat_template(
+                        msgs,
+                        tokenize=False,
+                        add_generation_prompt=False,
+                    )
+                    texts.append(text)
+                return texts
+
+            sft_config = SFTConfig(
+                per_device_train_batch_size=BATCH_SIZE,
+                gradient_accumulation_steps=GRAD_ACCUM,
                 warmup_steps=10,
                 max_steps=MAX_STEPS,
                 learning_rate=2e-4,
@@ -268,25 +291,17 @@ class ModelManager:
                 seed=3407,
                 output_dir=output_dir,
                 save_strategy="no",
+                max_seq_length=MAX_SEQ_LENGTH,
+                dataset_num_proc=2,
+                packing=True,
             )
-
-            def formatting_func(example):
-                """Apply Qwen3 chat template to each training example."""
-                return tokenizer.apply_chat_template(
-                    example["messages"],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
 
             trainer = SFTTrainer(
                 model=model,
                 tokenizer=tokenizer,
                 train_dataset=dataset,
                 formatting_func=formatting_func,
-                max_seq_length=2048,
-                dataset_num_proc=2,
-                packing=False,
-                args=training_args,
+                args=sft_config,
                 callbacks=[ProgressCallback(MAX_STEPS)],
             )
 
@@ -320,6 +335,7 @@ class ModelManager:
                 "status": "error", "progress": 0, "message": str(e)
             }
             raise
+
 
     # ─── Delete model ──────────────────────────────────────────────────────────
 
