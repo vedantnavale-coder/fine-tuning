@@ -51,17 +51,38 @@ class DeleteModelRequest(BaseModel):
 
 @app.post("/api/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(400, "Only PDF files allowed")
-    file_path = os.path.join(pdf_processor.upload_dir, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    return {"filename": file.filename, "status": "uploaded"}
+    """
+    Accepts both PDF and JSONL files.
+    PDFs go to uploads/
+    JSONL files go to uploads/ too — same folder, detected by extension at train time.
+    """
+    filename = file.filename
+
+    if filename.endswith('.pdf'):
+        file_path = os.path.join(pdf_processor.upload_dir, filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        return {"filename": filename, "status": "uploaded", "type": "pdf"}
+
+    elif filename.endswith('.jsonl'):
+        file_path = os.path.join(pdf_processor.upload_dir, filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        # Count lines for feedback
+        with open(file_path, "r", encoding="utf-8") as f:
+            line_count = sum(1 for l in f if l.strip())
+        return {"filename": filename, "status": "uploaded", "type": "jsonl", "lines": line_count}
+
+    else:
+        raise HTTPException(400, "Only PDF or JSONL files allowed")
+
 
 @app.get("/api/pdfs")
 async def list_pdfs():
+    """Lists both PDFs and JSONL files in the uploads folder."""
     pdfs = pdf_processor.list_pdfs()
     return {"pdfs": pdfs}
+
 
 @app.delete("/api/pdfs/{filename}")
 async def delete_pdf(filename: str):
@@ -69,7 +90,7 @@ async def delete_pdf(filename: str):
     if os.path.exists(path):
         os.remove(path)
         return {"status": "deleted"}
-    raise HTTPException(404, "PDF not found")
+    raise HTTPException(404, "File not found")
 
 # ─── Model management endpoints ──────────────────────────────────────────────
 
@@ -86,10 +107,10 @@ async def download_base_model():
     global download_thread
     if download_thread and download_thread.is_alive():
         raise HTTPException(400, "Download already in progress")
-    
+
     if model_manager.base_model_exists():
         return {"status": "exists", "message": "Base model already downloaded"}
-    
+
     download_thread = threading.Thread(target=model_manager.download_base_model)
     download_thread.start()
     return {"status": "started", "message": "Downloading Qwen3-4B..."}
@@ -108,45 +129,156 @@ async def delete_model(model_id: str):
 
 @app.post("/api/train")
 async def start_training(request: TrainRequest):
+    """
+    Same endpoint, same request body as before.
+
+    Logic change:
+    - If any file in request.pdfs ends with .jsonl → use import_jsonl() path directly.
+    - If all files are PDFs → extract text and chunk as before.
+    - Mixed (PDFs + JSONL) → extract PDF chunks AND merge JSONL samples together.
+    """
     global training_thread
     if training_thread and training_thread.is_alive():
         raise HTTPException(400, "Training already in progress")
     if not request.pdfs:
-        raise HTTPException(400, "No PDFs selected")
-    
+        raise HTTPException(400, "No files selected")
+
     def train_task():
         try:
-            model_manager.training_status = {
-                "status": "extracting", "progress": 5,
-                "message": f"Extracting text from {len(request.pdfs)} PDF(s)..."
-            }
-            all_chunks = []
-            for pdf_name in request.pdfs:
-                pdf_path = os.path.join(pdf_processor.upload_dir, pdf_name)
-                if os.path.exists(pdf_path):
-                    text = pdf_processor.extract_text(pdf_path)
-                    chunks = pdf_processor.chunk_text(text)
-                    all_chunks.extend(chunks)
-            
+            # Split file list into PDFs and JSONLs
+            pdf_files   = [f for f in request.pdfs if f.endswith('.pdf')]
+            jsonl_files = [f for f in request.pdfs if f.endswith('.jsonl')]
+
+            dataset_path = None
+
+            # ── Case 1: JSONL only ────────────────────────────────────────────
+            if jsonl_files and not pdf_files:
+                if len(jsonl_files) == 1:
+                    # Single JSONL — import directly
+                    model_manager.training_status = {
+                        "status": "preparing", "progress": 5,
+                        "message": f"Importing JSONL dataset: {jsonl_files[0]}..."
+                    }
+                    source = os.path.join(pdf_processor.upload_dir, jsonl_files[0])
+                    dataset_path = dataset_builder.import_jsonl(source)
+                else:
+                    # Multiple JSONLs — merge them first
+                    model_manager.training_status = {
+                        "status": "preparing", "progress": 5,
+                        "message": f"Merging {len(jsonl_files)} JSONL files..."
+                    }
+                    merged_path = os.path.join(dataset_builder.dataset_dir, "merged.jsonl")
+                    total = 0
+                    with open(merged_path, "w", encoding="utf-8") as out:
+                        for jf in jsonl_files:
+                            source = os.path.join(pdf_processor.upload_dir, jf)
+                            with open(source, "r", encoding="utf-8") as inp:
+                                for line in inp:
+                                    line = line.strip()
+                                    if not line:
+                                        continue
+                                    try:
+                                        obj = json.loads(line)
+                                        if "messages" in obj:
+                                            clean = {"messages": obj["messages"]}
+                                            out.write(json.dumps(clean, ensure_ascii=False) + "\n")
+                                            total += 1
+                                    except json.JSONDecodeError:
+                                        pass
+                    if total == 0:
+                        raise RuntimeError("No valid samples found in any JSONL file.")
+                    dataset_path = merged_path
+
+            # ── Case 2: PDFs only (original behavior) ─────────────────────────
+            elif pdf_files and not jsonl_files:
+                model_manager.training_status = {
+                    "status": "extracting", "progress": 5,
+                    "message": f"Extracting text from {len(pdf_files)} PDF(s)..."
+                }
+                all_chunks = []
+                for pdf_name in pdf_files:
+                    pdf_path = os.path.join(pdf_processor.upload_dir, pdf_name)
+                    if os.path.exists(pdf_path):
+                        text   = pdf_processor.extract_text(pdf_path)
+                        chunks = pdf_processor.chunk_text(text)
+                        all_chunks.extend(chunks)
+
+                model_manager.training_status = {
+                    "status": "building_dataset", "progress": 15,
+                    "message": f"Building dataset from {len(all_chunks)} chunks..."
+                }
+                dataset_path = dataset_builder.create_training_dataset(all_chunks)
+
+            # ── Case 3: Mixed PDFs + JSONL ────────────────────────────────────
+            else:
+                model_manager.training_status = {
+                    "status": "extracting", "progress": 5,
+                    "message": f"Processing {len(pdf_files)} PDF(s) and {len(jsonl_files)} JSONL file(s)..."
+                }
+
+                # Extract PDF chunks and write as JSONL samples
+                all_chunks = []
+                for pdf_name in pdf_files:
+                    pdf_path = os.path.join(pdf_processor.upload_dir, pdf_name)
+                    if os.path.exists(pdf_path):
+                        text   = pdf_processor.extract_text(pdf_path)
+                        chunks = pdf_processor.chunk_text(text)
+                        all_chunks.extend(chunks)
+
+                # Write PDF-derived samples to a temp file
+                merged_path = os.path.join(dataset_builder.dataset_dir, "merged.jsonl")
+                written = 0
+                with open(merged_path, "w", encoding="utf-8") as out:
+                    # PDF chunks first
+                    for chunk in all_chunks:
+                        msg = dataset_builder._build_message(chunk)
+                        out.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                        written += 1
+                    # Then JSONL samples
+                    for jf in jsonl_files:
+                        source = os.path.join(pdf_processor.upload_dir, jf)
+                        with open(source, "r", encoding="utf-8") as inp:
+                            for line in inp:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                    if "messages" in obj:
+                                        clean = {"messages": obj["messages"]}
+                                        out.write(json.dumps(clean, ensure_ascii=False) + "\n")
+                                        written += 1
+                                except json.JSONDecodeError:
+                                    pass
+
+                if written == 0:
+                    raise RuntimeError("No valid training samples produced.")
+                dataset_path = merged_path
+
+            # ── Count samples and kick off training ───────────────────────────
+            with open(dataset_path) as f:
+                sample_count = sum(1 for l in f if l.strip())
+
             model_manager.training_status = {
                 "status": "building_dataset", "progress": 15,
-                "message": f"Building dataset from {len(all_chunks)} chunks..."
+                "message": f"Dataset ready: {sample_count} samples. Starting training..."
             }
-            dataset_path = dataset_builder.create_training_dataset(all_chunks)
-            
+
             model_manager.train_model(
                 dataset_path=dataset_path,
                 base_model_id=request.base_model_id,
-                output_name=request.output_model_name
+                output_name=request.output_model_name,
             )
+
         except Exception as e:
             model_manager.training_status = {
                 "status": "error", "progress": 0, "message": str(e)
             }
-    
+
     training_thread = threading.Thread(target=train_task)
     training_thread.start()
     return {"status": "started"}
+
 
 @app.get("/api/training/status")
 async def get_training_status():

@@ -35,4 +35,8 @@ class PDFProcessor:
     def list_pdfs(self) -> List[str]:
         if not os.path.exists(self.upload_dir):
             return []
-        return sorted(f for f in os.listdir(self.upload_dir) if f.endswith('.pdf'))
+        # Return both PDFs and JSONL files so the UI can list and select them
+        return sorted(
+            f for f in os.listdir(self.upload_dir)
+            if f.endswith('.pdf') or f.endswith('.jsonl')
+        )
