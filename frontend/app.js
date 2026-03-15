@@ -146,8 +146,8 @@ dropZone.addEventListener('drop', e => {
 });
 
 async function handleFiles(files) {
-  const pdfs = Array.from(files).filter(f => f.name.endsWith('.pdf'));
-  if (!pdfs.length) { toast('Only PDF files are accepted', 'error'); return; }
+  const pdfs = Array.from(files).filter(f => f.name.endsWith('.pdf') || f.name.endsWith('.jsonl'));
+  if (!pdfs.length) { toast('Only PDF or JSONL files are accepted', 'error'); return; }
 
   for (const file of pdfs) {
     const fd = new FormData();
@@ -171,7 +171,7 @@ async function loadPdfList() {
     if (!data.pdfs.length) { el.innerHTML = '<span class="muted">No PDFs uploaded yet</span>'; return; }
     el.innerHTML = data.pdfs.map(pdf => `
       <div class="pdf-item">
-        <span>📄 ${pdf}</span>
+        <span>${pdf.endsWith('.jsonl') ? '🗃' : '📄'} ${pdf}</span>
         <button class="del-btn" onclick="deletePdf('${pdf}')" title="Delete">✕</button>
       </div>
     `).join('');
