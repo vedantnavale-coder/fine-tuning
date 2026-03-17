@@ -178,6 +178,30 @@ async function loadPdfList() {
   } catch (_) {}
 }
 
+async function reconnectTraining() {
+  try {
+    const s = await apiFetch('/training/status');
+
+    if (s.status === 'training' || s.status === 'preparing') {
+      toast('Training detected. Reconnecting...', 'info');
+
+      document.getElementById('trainStatusBadge').textContent =
+        s.status.toUpperCase();
+
+      document.getElementById('trainProgress').style.width =
+        (s.progress || 0) + '%';
+
+      pollTraining(document.getElementById('trainBtn'));
+
+    } else {
+      toast('No active training job', 'info');
+    }
+
+  } catch (e) {
+    toast('Could not reconnect: ' + e.message, 'error');
+  }
+}
+
 async function deletePdf(name) {
   if (!confirm(`Delete "${name}"?`)) return;
   try {
@@ -250,6 +274,7 @@ async function startTraining() {
     pollTraining(btn);
   } catch (e) {
     toast(e.message, 'error');
+    
     btn.disabled = false;
   }
 }
@@ -280,6 +305,7 @@ function pollTraining(btn) {
         toast('Training error: ' + s.message, 'error');
       }
     } catch (_) {}
+    setGlobalStatus('warn', 'Disconnected');
   }, 2000);
 }
 
@@ -494,8 +520,27 @@ async function sendMessage() {
   }
 }
 
+window.addEventListener("offline", () => {
+  toast("Connection lost. Waiting to reconnect...", "error");
+});
+
+window.addEventListener("online", () => {
+  toast("Connection restored. Checking training...", "info");
+  reconnectTraining();
+});
+
 // ── Init ───────────────────────────────────────────────────────────────────
 (async function init() {
   await checkBaseModel();
   await loadPdfList();
+
+  // check if training already running
+  try {
+    const s = await apiFetch('/training/status');
+
+    if (s.status === 'training' || s.status === 'preparing') {
+      toast('Training already running — reconnecting', 'info');
+      pollTraining(document.getElementById('trainBtn'));
+    }
+  } catch (_) {}
 })();

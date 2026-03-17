@@ -98,6 +98,20 @@ class ModelManager:
 
     def get_download_status(self) -> dict:
         return self.download_status
+    
+    def _clear_gpu_memory(self):
+        import gc
+        import torch
+        if self._chat_model is not None:
+            del self._chat_model
+            self._chat_model = None
+        if self._chat_tokenizer is not None:
+            del self._chat_tokenizer
+            self._chat_tokenizer = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()   # sometimes helps more
 
     def download_base_model(self):
         """Download Qwen3-4B from HuggingFace using snapshot_download."""
@@ -169,6 +183,8 @@ class ModelManager:
         from transformers import TrainerCallback
         from datasets import load_dataset
 
+        self._clear_gpu_memory()
+
         try:
             registry = self._load_registry()
             if base_model_id not in registry["models"]:
@@ -206,7 +222,7 @@ class ModelManager:
                 model_name=true_base_path,
                 max_seq_length=MAX_SEQ_LENGTH,
                 dtype=None,           # auto: bfloat16 on Ampere+
-                load_in_4bit=True,
+                load_in_4bit=False,
             )
 
             # Apply Qwen3 instruct chat template to tokenizer
@@ -392,6 +408,8 @@ class ModelManager:
         """
         if self.loaded_chat_model_id == model_id:
             return  # already loaded
+        
+        self._clear_gpu_memory()
 
         from unsloth import FastLanguageModel
 
