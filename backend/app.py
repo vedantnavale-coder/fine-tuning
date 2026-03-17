@@ -12,6 +12,7 @@ from typing import Optional
 from pdf_processor import PDFProcessor
 from dataset_builder import DatasetBuilder
 from model_manager import ModelManager
+import threading   # still needed if you want background later, but not used here
 
 app = FastAPI(title="AI Training Platform")
 
@@ -127,114 +128,58 @@ async def delete_model(model_id: str):
 
 # ─── Training endpoints ───────────────────────────────────────────────────────
 
+
 @app.post("/api/train")
 async def start_training(request: TrainRequest):
     """
-    Same endpoint, same request body as before.
-
-    Logic change:
-    - If any file in request.pdfs ends with .jsonl → use import_jsonl() path directly.
-    - If all files are PDFs → extract text and chunk as before.
-    - Mixed (PDFs + JSONL) → extract PDF chunks AND merge JSONL samples together.
+    Starts model training synchronously (blocks until training finishes).
+    This avoids import conflicts from threading + heavy libraries (unsloth/bitsandbytes).
+    
+    - JSONL only → import directly or merge
+    - PDFs only → extract → chunk → build dataset
+    - Mixed → extract PDF chunks + merge with JSONL samples
     """
-    global training_thread
-    if training_thread and training_thread.is_alive():
-        raise HTTPException(400, "Training already in progress")
+    # Prevent starting new training while one is already running
+    if model_manager.training_status["status"] not in ("idle", "completed", "error"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Training already in progress (status: {model_manager.training_status['status']})"
+        )
+
     if not request.pdfs:
-        raise HTTPException(400, "No files selected")
+        raise HTTPException(400, "No files selected (pdfs list is empty)")
 
-    def train_task():
-        try:
-            # Split file list into PDFs and JSONLs
-            pdf_files   = [f for f in request.pdfs if f.endswith('.pdf')]
-            jsonl_files = [f for f in request.pdfs if f.endswith('.jsonl')]
+    # Reset status at the very beginning
+    model_manager.training_status = {
+        "status": "preparing",
+        "progress": 0,
+        "message": "Starting training process..."
+    }
 
-            dataset_path = None
+    try:
+        # ── Split files into PDFs and JSONLs ────────────────────────────────
+        pdf_files   = [f for f in request.pdfs if f.lower().endswith('.pdf')]
+        jsonl_files = [f for f in request.pdfs if f.lower().endswith('.jsonl')]
 
-            # ── Case 1: JSONL only ────────────────────────────────────────────
-            if jsonl_files and not pdf_files:
-                if len(jsonl_files) == 1:
-                    # Single JSONL — import directly
-                    model_manager.training_status = {
-                        "status": "preparing", "progress": 5,
-                        "message": f"Importing JSONL dataset: {jsonl_files[0]}..."
-                    }
-                    source = os.path.join(pdf_processor.upload_dir, jsonl_files[0])
-                    dataset_path = dataset_builder.import_jsonl(source)
-                else:
-                    # Multiple JSONLs — merge them first
-                    model_manager.training_status = {
-                        "status": "preparing", "progress": 5,
-                        "message": f"Merging {len(jsonl_files)} JSONL files..."
-                    }
-                    merged_path = os.path.join(dataset_builder.dataset_dir, "merged.jsonl")
-                    total = 0
-                    with open(merged_path, "w", encoding="utf-8") as out:
-                        for jf in jsonl_files:
-                            source = os.path.join(pdf_processor.upload_dir, jf)
-                            with open(source, "r", encoding="utf-8") as inp:
-                                for line in inp:
-                                    line = line.strip()
-                                    if not line:
-                                        continue
-                                    try:
-                                        obj = json.loads(line)
-                                        if "messages" in obj:
-                                            clean = {"messages": obj["messages"]}
-                                            out.write(json.dumps(clean, ensure_ascii=False) + "\n")
-                                            total += 1
-                                    except json.JSONDecodeError:
-                                        pass
-                    if total == 0:
-                        raise RuntimeError("No valid samples found in any JSONL file.")
-                    dataset_path = merged_path
+        dataset_path = None
 
-            # ── Case 2: PDFs only (original behavior) ─────────────────────────
-            elif pdf_files and not jsonl_files:
-                model_manager.training_status = {
-                    "status": "extracting", "progress": 5,
-                    "message": f"Extracting text from {len(pdf_files)} PDF(s)..."
-                }
-                all_chunks = []
-                for pdf_name in pdf_files:
-                    pdf_path = os.path.join(pdf_processor.upload_dir, pdf_name)
-                    if os.path.exists(pdf_path):
-                        text   = pdf_processor.extract_text(pdf_path)
-                        chunks = pdf_processor.chunk_text(text)
-                        all_chunks.extend(chunks)
-
-                model_manager.training_status = {
-                    "status": "building_dataset", "progress": 15,
-                    "message": f"Building dataset from {len(all_chunks)} chunks..."
-                }
-                dataset_path = dataset_builder.create_training_dataset(all_chunks)
-
-            # ── Case 3: Mixed PDFs + JSONL ────────────────────────────────────
+        # Case 1: JSONL files only
+        if jsonl_files and not pdf_files:
+            if len(jsonl_files) == 1:
+                model_manager.training_status.update({
+                    "progress": 5,
+                    "message": f"Importing single JSONL: {jsonl_files[0]}..."
+                })
+                source = os.path.join(pdf_processor.upload_dir, jsonl_files[0])
+                dataset_path = dataset_builder.import_jsonl(source)
             else:
-                model_manager.training_status = {
-                    "status": "extracting", "progress": 5,
-                    "message": f"Processing {len(pdf_files)} PDF(s) and {len(jsonl_files)} JSONL file(s)..."
-                }
-
-                # Extract PDF chunks and write as JSONL samples
-                all_chunks = []
-                for pdf_name in pdf_files:
-                    pdf_path = os.path.join(pdf_processor.upload_dir, pdf_name)
-                    if os.path.exists(pdf_path):
-                        text   = pdf_processor.extract_text(pdf_path)
-                        chunks = pdf_processor.chunk_text(text)
-                        all_chunks.extend(chunks)
-
-                # Write PDF-derived samples to a temp file
+                model_manager.training_status.update({
+                    "progress": 5,
+                    "message": f"Merging {len(jsonl_files)} JSONL files..."
+                })
                 merged_path = os.path.join(dataset_builder.dataset_dir, "merged.jsonl")
-                written = 0
+                total = 0
                 with open(merged_path, "w", encoding="utf-8") as out:
-                    # PDF chunks first
-                    for chunk in all_chunks:
-                        msg = dataset_builder._build_message(chunk)
-                        out.write(json.dumps(msg, ensure_ascii=False) + "\n")
-                        written += 1
-                    # Then JSONL samples
                     for jf in jsonl_files:
                         source = os.path.join(pdf_processor.upload_dir, jf)
                         with open(source, "r", encoding="utf-8") as inp:
@@ -245,40 +190,109 @@ async def start_training(request: TrainRequest):
                                 try:
                                     obj = json.loads(line)
                                     if "messages" in obj:
-                                        clean = {"messages": obj["messages"]}
-                                        out.write(json.dumps(clean, ensure_ascii=False) + "\n")
-                                        written += 1
+                                        out.write(json.dumps({"messages": obj["messages"]}, ensure_ascii=False) + "\n")
+                                        total += 1
                                 except json.JSONDecodeError:
-                                    pass
-
-                if written == 0:
-                    raise RuntimeError("No valid training samples produced.")
+                                    continue
+                if total == 0:
+                    raise RuntimeError("No valid training examples found in any JSONL file.")
                 dataset_path = merged_path
 
-            # ── Count samples and kick off training ───────────────────────────
-            with open(dataset_path) as f:
-                sample_count = sum(1 for l in f if l.strip())
+        # Case 2: PDFs only
+        elif pdf_files and not jsonl_files:
+            model_manager.training_status.update({
+                "status": "extracting",
+                "progress": 5,
+                "message": f"Extracting text from {len(pdf_files)} PDF(s)..."
+            })
+            all_chunks = []
+            for pdf_name in pdf_files:
+                pdf_path = os.path.join(pdf_processor.upload_dir, pdf_name)
+                if os.path.exists(pdf_path):
+                    text = pdf_processor.extract_text(pdf_path)
+                    chunks = pdf_processor.chunk_text(text)
+                    all_chunks.extend(chunks)
 
-            model_manager.training_status = {
-                "status": "building_dataset", "progress": 15,
-                "message": f"Dataset ready: {sample_count} samples. Starting training..."
-            }
+            model_manager.training_status.update({
+                "status": "building_dataset",
+                "progress": 15,
+                "message": f"Building dataset from {len(all_chunks)} chunks..."
+            })
+            dataset_path = dataset_builder.create_training_dataset(all_chunks)
 
-            model_manager.train_model(
-                dataset_path=dataset_path,
-                base_model_id=request.base_model_id,
-                output_name=request.output_model_name,
-            )
+        # Case 3: Mixed PDFs + JSONL
+        else:
+            model_manager.training_status.update({
+                "status": "extracting",
+                "progress": 5,
+                "message": f"Processing {len(pdf_files)} PDF(s) + {len(jsonl_files)} JSONL file(s)..."
+            })
 
-        except Exception as e:
-            model_manager.training_status = {
-                "status": "error", "progress": 0, "message": str(e)
-            }
+            all_chunks = []
+            for pdf_name in pdf_files:
+                pdf_path = os.path.join(pdf_processor.upload_dir, pdf_name)
+                if os.path.exists(pdf_path):
+                    text = pdf_processor.extract_text(pdf_path)
+                    chunks = pdf_processor.chunk_text(text)
+                    all_chunks.extend(chunks)
 
-    training_thread = threading.Thread(target=train_task)
-    training_thread.start()
-    return {"status": "started"}
+            merged_path = os.path.join(dataset_builder.dataset_dir, "merged.jsonl")
+            written = 0
+            with open(merged_path, "w", encoding="utf-8") as out:
+                # PDF chunks → synthetic instruction messages
+                for chunk in all_chunks:
+                    msg = dataset_builder._build_message(chunk)
+                    out.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                    written += 1
+                # Append real JSONL samples
+                for jf in jsonl_files:
+                    source = os.path.join(pdf_processor.upload_dir, jf)
+                    with open(source, "r", encoding="utf-8") as inp:
+                        for line in inp:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                                if "messages" in obj:
+                                    out.write(json.dumps({"messages": obj["messages"]}, ensure_ascii=False) + "\n")
+                                    written += 1
+                            except json.JSONDecodeError:
+                                continue
 
+            if written == 0:
+                raise RuntimeError("No valid training samples produced from PDFs or JSONL files.")
+            dataset_path = merged_path
+
+        # Final check & start actual training
+        if not dataset_path or not os.path.exists(dataset_path):
+            raise RuntimeError("Failed to create dataset file.")
+
+        with open(dataset_path, encoding="utf-8") as f:
+            sample_count = sum(1 for line in f if line.strip())
+
+        model_manager.training_status.update({
+            "status": "building_dataset",
+            "progress": 20,
+            "message": f"Dataset ready ({sample_count} samples). Starting fine-tuning..."
+        })
+
+        # This call blocks until training is complete
+        model_manager.train_model(
+            dataset_path=dataset_path,
+            base_model_id=request.base_model_id,
+            output_name=request.output_model_name,
+        )
+
+        return {"status": "completed", "message": "Training finished successfully"}
+
+    except Exception as e:
+        model_manager.training_status = {
+            "status": "error",
+            "progress": 0,
+            "message": f"Training failed: {str(e)}"
+        }
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/training/status")
 async def get_training_status():
